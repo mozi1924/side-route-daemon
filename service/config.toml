@@ -1,0 +1,9 @@
+# Side-Route Daemon 配置文件
+side_router_mac = "bc:24:11:84:71:8b"
+table_id = 200
+mark_id = 1
+wan_interface = "pppoe-wan"
+lan_interface = "br-lan"
+check_interval_secs = 3
+uci_dhcp_path = "/etc/config/dhcp"
+static_client_macs = []
