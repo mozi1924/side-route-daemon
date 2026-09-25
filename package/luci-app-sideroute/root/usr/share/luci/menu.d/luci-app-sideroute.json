@@ -1,0 +1,10 @@
+{
+	"admin/services/sideroute": {
+		"title": "Side Route",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "sideroute/overview"
+		}
+	}
+}

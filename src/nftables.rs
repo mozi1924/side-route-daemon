@@ -19,64 +19,107 @@ impl NftablesManager {
         }
     }
 
-    /// 应用独立表规则：包含外网入站连接跟踪保护与旁路由分流
+    pub fn update_params(&mut self, wan_interface: String, mark_id: u32) {
+        self.wan_interface = wan_interface;
+        self.mark_id = mark_id;
+    }
+
     pub fn apply_rules(
         &self,
         client_macs: &[String],
-        side_router_ipv6: &str,
+        enable_ipv4: bool,
+        side_ipv4: Option<&str>,
+        enable_ipv6: bool,
+        side_ipv6: Option<&str>,
+        hijack_dns: bool,
     ) -> Result<()> {
         let mut ruleset = String::new();
 
-        // 建立独立的 inet table
         ruleset.push_str(&format!("table inet {} {{\n", TABLE_NAME));
 
-        // 1. mangle prerouting chain: 用于流量打标记
         ruleset.push_str("    chain prerouting {\n");
         ruleset.push_str("        type filter hook prerouting priority mangle - 5; policy accept;\n");
 
-        // (a) 来自 WAN 的新连接，打上 0x200 的连接标记
         ruleset.push_str(&format!(
             "        iifname \"{}\" ct state new ct mark set 0x{:x}\n",
             self.wan_interface, INBOUND_CT_MARK
         ));
 
-        // (b) 凡是属于外网入站连接的数据包（回包），直接 accept，跳过后续所有打标！
         ruleset.push_str(&format!(
             "        ct mark 0x{:x} accept\n",
             INBOUND_CT_MARK
         ));
 
-        // (c) 客户端主动外发流量：如果属于旁路由白名单 MAC，打上策略路由标记
+        ruleset.push_str("        ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } accept\n");
+        ruleset.push_str("        ip6 daddr { fe80::/10, fc00::/7, ff00::/8 } accept\n");
+
         for mac in client_macs {
-            ruleset.push_str(&format!(
-                "        ether saddr {} counter meta mark set {}\n",
-                mac, self.mark_id
-            ));
+            if enable_ipv4 && side_ipv4.is_some() {
+                ruleset.push_str(&format!(
+                    "        ether saddr {} ip version 4 counter meta mark set {}\n",
+                    mac, self.mark_id
+                ));
+            }
+            if enable_ipv6 && side_ipv6.is_some() {
+                ruleset.push_str(&format!(
+                    "        ether saddr {} ip6 version 6 counter meta mark set {}\n",
+                    mac, self.mark_id
+                ));
+            }
         }
         ruleset.push_str("    }\n");
 
-        // 2. dstnat chain: 用于 DNS (53) 劫持到旁路由
         ruleset.push_str("    chain dstnat {\n");
         ruleset.push_str("        type nat hook prerouting priority dstnat - 5; policy accept;\n");
-        for mac in client_macs {
-            ruleset.push_str(&format!(
-                "        ether saddr {} udp dport 53 counter dnat ip6 to [{}]:53\n",
-                mac, side_router_ipv6
-            ));
-            ruleset.push_str(&format!(
-                "        ether saddr {} tcp dport 53 counter dnat ip6 to [{}]:53\n",
-                mac, side_router_ipv6
-            ));
+        if hijack_dns && !client_macs.is_empty() {
+            for mac in client_macs {
+                if enable_ipv4 {
+                    if let Some(v4) = side_ipv4 {
+                        ruleset.push_str(&format!(
+                            "        ether saddr {} meta l4proto {{ tcp, udp }} th dport 53 counter dnat ip to {}:53\n",
+                            mac, v4
+                        ));
+                    }
+                }
+                if enable_ipv6 {
+                    if let Some(v6) = side_ipv6 {
+                        ruleset.push_str(&format!(
+                            "        ether saddr {} meta l4proto {{ tcp, udp }} th dport 53 counter dnat ip6 to [{}]:53\n",
+                            mac, v6
+                        ));
+                    }
+                }
+            }
         }
         ruleset.push_str("    }\n");
+
+        if hijack_dns && !client_macs.is_empty() {
+            ruleset.push_str("    chain postrouting {\n");
+            ruleset.push_str("        type nat hook postrouting priority srcnat; policy accept;\n");
+            if enable_ipv4 {
+                if let Some(v4) = side_ipv4 {
+                    ruleset.push_str(&format!(
+                        "        ip daddr {} th dport 53 counter masquerade\n",
+                        v4
+                    ));
+                }
+            }
+            if enable_ipv6 {
+                if let Some(v6) = side_ipv6 {
+                    ruleset.push_str(&format!(
+                        "        ip6 daddr {} th dport 53 counter masquerade\n",
+                        v6
+                    ));
+                }
+            }
+            ruleset.push_str("    }\n");
+        }
         ruleset.push_str("}\n");
 
         debug!("Applying nftables ruleset:\n{}", ruleset);
 
-        // 先清理可能存在的旧表
         self.clear_rules();
 
-        // 原子化载入 ruleset
         let mut child = Command::new("nft")
             .arg("-f")
             .arg("-")
@@ -97,14 +140,15 @@ impl NftablesManager {
         }
 
         info!(
-            "Successfully applied nftables ruleset ({} clients -> [{}])",
+            "Successfully applied nftables ruleset ({} clients, IPv4: {:?}, IPv6: {:?})",
             client_macs.len(),
-            side_router_ipv6
+            side_ipv4,
+            side_ipv6
         );
+
         Ok(())
     }
 
-    /// 清空独立表（容灾降级或退出时调用）
     pub fn clear_rules(&self) {
         let _ = Command::new("nft")
             .args(["delete", "table", "inet", TABLE_NAME])

@@ -1,56 +1,177 @@
 use log::{debug, warn};
+use std::fs;
 use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SideRouterInfo {
-    pub ipv6: String,
     pub mac: String,
+    pub ipv4: Option<String>,
+    pub ipv6: Option<String>,
 }
 
 pub struct HealthChecker {
     side_mac: String,
     lan_interface: String,
-    last_known_ip: Option<String>,
+    configured_ipv4: Option<String>,
+    last_known_ipv4: Option<String>,
+    last_known_ipv6: Option<String>,
 }
 
 impl HealthChecker {
-    pub fn new(side_mac: String, lan_interface: String) -> Self {
+    pub fn new(
+        side_mac: String,
+        lan_interface: String,
+        configured_ipv4: Option<String>,
+    ) -> Self {
         Self {
             side_mac: side_mac.to_lowercase(),
             lan_interface,
-            last_known_ip: None,
+            configured_ipv4,
+            last_known_ipv4: None,
+            last_known_ipv6: None,
         }
     }
 
-    /// 执行一次探测：返回存活的旁路由 IPv6 地址
-    pub fn check(&mut self) -> Option<SideRouterInfo> {
-        // 1. 如果有上次成功的 IP，先快速 ping 一次确认是否仍然存活
-        if let Some(ref ip) = self.last_known_ip {
-            if self.ping_ipv6(ip) {
-                return Some(SideRouterInfo {
-                    ipv6: ip.clone(),
-                    mac: self.side_mac.clone(),
-                });
+    pub fn update_params(
+        &mut self,
+        side_mac: String,
+        lan_interface: String,
+        configured_ipv4: Option<String>,
+    ) {
+        let mac_lower = side_mac.to_lowercase();
+        if self.side_mac != mac_lower {
+            self.side_mac = mac_lower;
+            self.last_known_ipv4 = None;
+            self.last_known_ipv6 = None;
+        }
+        self.lan_interface = lan_interface;
+        self.configured_ipv4 = configured_ipv4;
+    }
+
+    pub fn check(&mut self, enable_v4: bool, enable_v6: bool) -> Option<SideRouterInfo> {
+        if self.side_mac.is_empty() {
+            return None;
+        }
+
+        let mut current_v4 = None;
+        let mut current_v6 = None;
+
+        if enable_v4 {
+            current_v4 = self.check_ipv4();
+        }
+
+        if enable_v6 {
+            current_v6 = self.check_ipv6();
+        }
+
+        if (enable_v4 && current_v4.is_some()) || (enable_v6 && current_v6.is_some()) {
+            Some(SideRouterInfo {
+                mac: self.side_mac.clone(),
+                ipv4: current_v4,
+                ipv6: current_v6,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn check_ipv4(&mut self) -> Option<String> {
+        if let Some(ref static_ip) = self.configured_ipv4 {
+            if self.ping_ipv4(static_ip) {
+                self.last_known_ipv4 = Some(static_ip.clone());
+                return Some(static_ip.clone());
             } else {
-                debug!("Last known IP {} is unreachable, rediscovering...", ip);
+                debug!("Configured static IPv4 {} is unreachable", static_ip);
+                return None;
             }
         }
 
-        // 2. 刷新 NDP 缓存（唤起组播探测）
+        if let Some(ref ip) = self.last_known_ipv4 {
+            if self.ping_ipv4(ip) {
+                return Some(ip.clone());
+            }
+        }
+
+        let candidates = self.lookup_candidates_ipv4();
+        for ip in candidates {
+            if self.ping_ipv4(&ip) {
+                self.last_known_ipv4 = Some(ip.clone());
+                return Some(ip);
+            }
+        }
+
+        self.last_known_ipv4 = None;
+        None
+    }
+
+    fn lookup_candidates_ipv4(&self) -> Vec<String> {
+        let mut ips = Vec::new();
+
+        if let Ok(output) = Command::new("ip")
+            .args(["-4", "neigh", "show", "dev", &self.lan_interface])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let lower = line.to_lowercase();
+                if lower.contains(&self.side_mac) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if !parts.is_empty() {
+                        ips.push(parts[0].to_string());
+                    }
+                }
+            }
+        }
+
+        if ips.is_empty() {
+            if let Ok(arp_content) = fs::read_to_string("/proc/net/arp") {
+                for line in arp_content.lines().skip(1) {
+                    let lower = line.to_lowercase();
+                    if lower.contains(&self.side_mac) {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if !parts.is_empty() {
+                            ips.push(parts[0].to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        ips
+    }
+
+    fn ping_ipv4(&self, ip: &str) -> bool {
+        let status = Command::new("ping")
+            .args(["-c", "1", "-W", "1", "-I", &self.lan_interface, ip])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        match status {
+            Ok(s) => s.success(),
+            Err(_) => false,
+        }
+    }
+
+    fn check_ipv6(&mut self) -> Option<String> {
+        if let Some(ref ip) = self.last_known_ipv6 {
+            if self.ping_ipv6(ip) {
+                return Some(ip.clone());
+            } else {
+                debug!("Last known IPv6 {} is unreachable, rediscovering...", ip);
+            }
+        }
+
         let _ = Command::new("ping6")
             .args(["-c", "1", "-W", "1", "-I", &self.lan_interface, "ff02::1"])
             .output();
 
-        // 3. 读取当前邻居表中与目标 MAC 关联的所有 IPv6
-        let candidates = self.lookup_candidates();
+        let candidates = self.lookup_candidates_ipv6();
         if candidates.is_empty() {
-            warn!("No IPv6 neighbor entry found for MAC {}", self.side_mac);
-            self.last_known_ip = None;
+            self.last_known_ipv6 = None;
             return None;
         }
 
-        // 4. 排序优先级：
-        // 首选 ULA (fd..)，次选公网 GUA (240..)，再次选链路本地 (fe80..)
         let mut sorted = candidates;
         sorted.sort_by_key(|ip| {
             if ip.starts_with("fd") {
@@ -64,22 +185,18 @@ impl HealthChecker {
             }
         });
 
-        // 5. 挨个 ping 测试连通性
         for ip in sorted {
             if self.ping_ipv6(&ip) {
-                self.last_known_ip = Some(ip.clone());
-                return Some(SideRouterInfo {
-                    ipv6: ip,
-                    mac: self.side_mac.clone(),
-                });
+                self.last_known_ipv6 = Some(ip.clone());
+                return Some(ip);
             }
         }
 
-        self.last_known_ip = None;
+        self.last_known_ipv6 = None;
         None
     }
 
-    fn lookup_candidates(&self) -> Vec<String> {
+    fn lookup_candidates_ipv6(&self) -> Vec<String> {
         let output = match Command::new("ip")
             .args(["-6", "neigh", "show", "dev", &self.lan_interface])
             .output()
