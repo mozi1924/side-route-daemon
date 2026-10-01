@@ -76,6 +76,7 @@ rm -rf "$STAGING_DIR"
 mkdir -p "$STAGING_DIR/usr/bin"
 mkdir -p "$STAGING_DIR/etc/config"
 mkdir -p "$STAGING_DIR/etc/init.d"
+mkdir -p "$STAGING_DIR/etc/uci-defaults"
 mkdir -p "$STAGING_DIR/usr/share/luci/menu.d"
 mkdir -p "$STAGING_DIR/usr/share/rpcd/acl.d"
 mkdir -p "$STAGING_DIR/www/luci-static/resources/view/sideroute"
@@ -89,10 +90,38 @@ cp package/luci-app-sideroute/root/etc/config/sideroute "$STAGING_DIR/etc/config
 cp package/luci-app-sideroute/root/etc/init.d/sideroute "$STAGING_DIR/etc/init.d/sideroute"
 chmod 755 "$STAGING_DIR/etc/init.d/sideroute"
 
+# 拷贝 uci-defaults 脚本（安装后自动 enable 并按需启动）
+cp package/luci-app-sideroute/root/etc/uci-defaults/80_luci-app-sideroute "$STAGING_DIR/etc/uci-defaults/80_luci-app-sideroute"
+chmod 755 "$STAGING_DIR/etc/uci-defaults/80_luci-app-sideroute"
+
 # 拷贝 LuCI 界面资源
 cp package/luci-app-sideroute/root/usr/share/luci/menu.d/luci-app-sideroute.json "$STAGING_DIR/usr/share/luci/menu.d/luci-app-sideroute.json"
 cp package/luci-app-sideroute/root/usr/share/rpcd/acl.d/luci-app-sideroute.json "$STAGING_DIR/usr/share/rpcd/acl.d/luci-app-sideroute.json"
 cp package/luci-app-sideroute/root/www/luci-static/resources/view/sideroute/overview.js "$STAGING_DIR/www/luci-static/resources/view/sideroute/overview.js"
+
+# 准备 apk 维护控制脚本
+cat << 'EOF' > "$SCRIPT_DIR/target/post-install.sh"
+#!/bin/sh
+chown -R root:root /usr/bin/side-route-daemon /etc/init.d/sideroute /etc/config/sideroute /usr/share/luci/menu.d/luci-app-sideroute.json /usr/share/rpcd/acl.d/luci-app-sideroute.json /www/luci-static/resources/view/sideroute 2>/dev/null || true
+chmod 755 /etc/init.d/sideroute 2>/dev/null || true
+/etc/init.d/sideroute enable
+if [ "$(uci -q get sideroute.config.enabled)" = "1" ]; then
+	/etc/init.d/sideroute restart
+fi
+/etc/init.d/rpcd reload 2>/dev/null || true
+rm -f /tmp/luci-indexcache.* 2>/dev/null || true
+exit 0
+EOF
+chmod 755 "$SCRIPT_DIR/target/post-install.sh"
+
+cat << 'EOF' > "$SCRIPT_DIR/target/pre-deinstall.sh"
+#!/bin/sh
+/etc/init.d/sideroute stop 2>/dev/null || true
+/etc/init.d/sideroute disable 2>/dev/null || true
+rm -f /tmp/luci-indexcache.* 2>/dev/null || true
+exit 0
+EOF
+chmod 755 "$SCRIPT_DIR/target/pre-deinstall.sh"
 
 # 5. 打包生成 .apk (OpenWrt v3 apk 格式)
 mkdir -p "$OUTPUT_DIR"
@@ -100,9 +129,12 @@ APK_FILE="$OUTPUT_DIR/${PKG_NAME}_${PKG_VERSION}_${ARCH}.apk"
 rm -f "$APK_FILE"
 
 echo "--> 正在生成 apk 软件包: $APK_FILE"
-"$HOST_APK" mkpkg \
+fakeroot "$HOST_APK" mkpkg \
     --output "$APK_FILE" \
     --files "$STAGING_DIR" \
+    --script "post-install:$SCRIPT_DIR/target/post-install.sh" \
+    --script "post-upgrade:$SCRIPT_DIR/target/post-install.sh" \
+    --script "pre-deinstall:$SCRIPT_DIR/target/pre-deinstall.sh" \
     --info "name:$PKG_NAME" \
     --info "version:$PKG_VERSION" \
     --info "arch:$ARCH" \

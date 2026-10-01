@@ -1,0 +1,11 @@
+#!/bin/sh
+
+# 自动配置 sideroute 服务开机自启
+/etc/init.d/sideroute enable
+
+# 如果配置已启用，则自动启动/重启服务
+if [ "$(uci -q get sideroute.config.enabled)" = "1" ]; then
+	/etc/init.d/sideroute restart
+fi
+
+exit 0

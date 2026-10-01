@@ -1,14 +1,21 @@
 {
 	"luci-app-sideroute": {
-		"description": "Grant access to sideroute configuration and status",
+		"description": "Grant access to sideroute configuration, service management and status",
 		"read": {
 			"uci": [ "sideroute", "network", "dhcp" ],
 			"file": {
 				"/tmp/sideroute.json": [ "read" ]
+			},
+			"ubus": {
+				"service": [ "list" ],
+				"rc": [ "list" ]
 			}
 		},
 		"write": {
-			"uci": [ "sideroute" ]
+			"uci": [ "sideroute" ],
+			"ubus": {
+				"rc": [ "init" ]
+			}
 		}
 	}
 }
